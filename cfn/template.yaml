@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to deploy API Gateway with ALB and Global Accelerator
+
+Resources:
+  MyLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties: 
+      FunctionName: MyGetFunction
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            const response = {
+              statusCode: 200,
+              body: JSON.stringify('Hello from Lambda!'),
+            };
+            return response;
+          };
+      Runtime: nodejs20.x
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'LambdaExecutionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt MyLambdaFunction.Arn
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/GET/myresource'
+
+
+#------- API gateway resources
+
+  ApiGatewayRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: 'MyApiGateway'
+      Description: 'API Gateway with a simple GET method'
+      EndpointConfiguration: 
+        Types: 
+          - PRIVATE
+        VpcEndpointIds: 
+          - !Ref ApiGatewayVpcEndpoint
+
+      Policy: 
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+
+  ApiGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: 'myresource'
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: 'NONE'
+      HttpMethod: 'GET'
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: 'POST'
+        Type: 'AWS_PROXY'
+        Uri: !Sub 
+          - 'arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+          - Region: !Ref 'AWS::Region'
+            LambdaArn: !GetAtt MyLambdaFunction.Arn
+
+  ApiGatewayStage:
+    DependsOn: 
+      - ApiGatewayMethod
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: 'test-stage'
+      DeploymentId: !Ref MyDeployment
+      TracingEnabled: true
+
+  MyDeployment:
+    DependsOn:
+      - ApiGatewayMethod
+    Type: AWS::ApiGateway::Deployment
+    Properties: 
+      RestApiId: !Ref ApiGatewayRestApi
+
+
+
+# VPC ----- 
+
+  LoadBalancerVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames : true
+      EnableDnsSupport : true
+
+  DefaultRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LoadBalancerVpc
+
+  DefaultRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref DefaultRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Load Balancer
+      GroupName: LoadBalancer-SecurityGroup
+      VpcId: !Ref LoadBalancerVpc
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LoadBalancerVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs
+          Ref: 'AWS::Region'
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LoadBalancerVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - '1'
+        - !GetAZs
+          Ref: 'AWS::Region'        
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LoadBalancerVpc
+      CidrBlock: 10.0.4.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs
+          Ref: 'AWS::Region'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LoadBalancerVpc
+
+  PublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+         Ref: LoadBalancerVpc
+      InternetGatewayId:
+         Ref: InternetGateway
+
+  IGWRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+       RouteTableId:
+         Ref: PublicRouteTable
+       DestinationCidrBlock: 0.0.0.0/0
+       GatewayId:
+         Ref: InternetGateway
+
+# ---- VPC Endpoint -------- 
+
+  # Create VPC Endpoint for API Gateway
+  ApiGatewayVpcEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.execute-api'
+      VpcId: !Ref LoadBalancerVpc
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # Security Group for VPC Endpoint
+  VpcEndpointSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Allow access to VPC Endpoint
+      VpcId: !Ref LoadBalancerVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '10.0.0.0/16'
+
+
+# # LB --------
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: 'MyLoadBalancer'
+      Scheme: 'internet-facing'
+      Subnets:
+        - !Ref PrivateSubnetA  
+        - !Ref PrivateSubnetB
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup  
+      Type: 'application'
+
+# Change the Resource Name if Port is changed
+  TargetGroup2:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Name: 'MyTargetGroup2'
+      Port: 443
+      Protocol: 'HTTPS'
+      VpcId: !Ref LoadBalancerVpc
+      TargetType: 'ip'
+      HealthCheckEnabled: true
+      HealthCheckPath: '/'
+      Matcher:
+        HttpCode: '403'
+        # Targets needs to be configured later 
+      # Targets:
+      #   - Id: !GetAtt ApiGatewayVpcEndpoint.DnsEntries
+
+  TargetGroupListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: 'forward'
+          TargetGroupArn: !Ref TargetGroup2
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: 'HTTPS' 
+      Certificates: 
+          - CertificateArn: !Ref APIDomainACM
+
+
+# Listener Certificates: 
+  ALBListenerCertificate: 
+    Type: AWS::ElasticLoadBalancingV2::ListenerCertificate
+    Properties:
+      Certificates: 
+        - CertificateArn: !Ref APIDomainACM
+      ListenerArn: !Ref TargetGroupListener
+
+  APIDomainACM:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: dev.testrewardsapp.com
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: dev.testrewardsapp.com
+          HostedZoneId: Z027521127PBOY9UFTSQN   
+        
+
+# # GA -------
+
+
+  GlobalAccelerator:
+    Type: 'AWS::GlobalAccelerator::Accelerator'
+    Properties:
+      Name: 'MyAccelerator'
+      Enabled: true
+      IpAddressType: 'IPV4'
+
+  AcceleratorEndpointGroup1:
+    Type: 'AWS::GlobalAccelerator::EndpointGroup'
+    Properties:
+      ListenerArn: !Ref AcceleratorEndpointListener1
+      EndpointConfigurations:
+        - EndpointId: !Ref LoadBalancer
+      TrafficDialPercentage: 100
+      HealthCheckProtocol: 'HTTPS'
+      HealthCheckPort: 443
+      HealthCheckPath: '/'
+      HealthCheckIntervalSeconds: 30
+      ThresholdCount: 3
+      EndpointGroupRegion: ap-south-1
+
+  AcceleratorEndpointListener1:
+    Type: 'AWS::GlobalAccelerator::Listener'
+    Properties:
+      AcceleratorArn: !Ref GlobalAccelerator
+      Protocol: 'TCP'
+      PortRanges:
+        - FromPort: 443
+          ToPort: 443
+      ClientAffinity: 'NONE'    
+
